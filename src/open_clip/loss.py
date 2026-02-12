@@ -1,5 +1,6 @@
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -238,6 +239,101 @@ class DistillClipLoss(ClipLoss):
 
         return contrastive_loss, distill_loss
 
+
+class ClipKDLoss(ClipLoss):
+    def __init__(self,
+            s_embed,
+            t_embed,
+            local_loss=False,
+            gather_with_grad=False,
+            cache_labels=False,
+            rank=0,
+            world_size=1,
+            use_horovod=False,
+):
+        super().__init__(
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod
+        )
+        self.s_embed = s_embed
+        self.t_embed = t_embed
+        if t_embed != s_embed:
+            self.visual_proj = nn.Linear(s_embed, t_embed)
+            self.text_proj = nn.Linear(s_embed, t_embed)
+        self.cross_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+    def dist_loss(self, teacher_logits, student_logits):
+        p_s = F.log_softmax(student_logits, dim=1)
+        p_t = F.softmax(teacher_logits, dim=1)
+        loss = F.kl_div(p_s, p_t, reduction='batchmean')
+        return loss
+
+    def forward(
+            self,
+            image_features,
+            text_features,
+            logit_scale,
+            dist_image_features,
+            dist_text_features,
+            dist_logit_scale,
+            dist_logit_bias=None,
+            output_dict=False,
+    ):
+        all_image, all_text = gather_features(image_features,
+                text_features,
+                local_loss=self.local_loss,
+                gather_with_grad=self.gather_with_grad,
+                rank=self.rank,
+                world_size=self.world_size,
+                use_horovod=self.use_horovod,
+        )
+        dist_all_image, dist_all_text = gather_features(dist_image_features,
+                dist_text_features,
+                local_loss=self.local_loss,
+                gather_with_grad=self.gather_with_grad,
+                rank=self.rank,
+                world_size=self.world_size,
+                use_horovod=self.use_horovod,
+        )
+        dist_logits_per_image = dist_logit_scale * dist_all_image @ dist_all_text.T
+        if dist_logit_bias is not None:
+            dist_logits_per_image += dist_logit_bias
+        dist_logits_per_text = dist_logits_per_image.T
+
+        if self.local_loss:
+            image_features, text_features = F.normalize(image_features, dim=-1), F.normalize(text_features, dim=-1)
+            logits_per_image = logit_scale * image_features @ all_text.T
+            logits_per_text = logit_scale * text_features @ all_image.T
+        else:
+            logits_per_image = logit_scale * all_image @ all_text.T
+            logits_per_text = logits_per_image.T
+
+
+        labels = self.get_ground_truth(image_features.device, logits_per_image.shape[0])
+
+        contrastive_loss = (F.cross_entropy(logits_per_image, labels) + F.cross_entropy(logits_per_text, labels)) / 2
+
+        if self.s_embed != self.t_embed:
+            all_image = self.visual_proj(all_image)
+            all_text = self.text_proj(all_text)
+
+        fd_loss = (F.mse_loss(all_image, dist_all_image) + F.mse_loss(all_text, dist_all_text)) * 2000
+        logits_per_s_image_to_t_text = self.cross_logit_scale * all_image @ dist_all_text.T
+        logits_per_s_text_to_t_image = self.cross_logit_scale * all_text @ dist_all_image.T
+        icl_loss = (F.cross_entropy(logits_per_s_image_to_t_text, labels) + F.cross_entropy(logits_per_s_text_to_t_image, labels)) / 2
+        ckd_loss = (
+            self.dist_loss(logits_per_image, dist_logits_per_image.detach()) +\
+            self.dist_loss(logits_per_text, dist_logits_per_text.detach())
+        ) / 2
+
+        if output_dict:
+            return {"contrastive_loss": contrastive_loss, "fd_loss": fd_loss, "icl_loss": icl_loss, "ckd_loss": ckd_loss}
+
+        return contrastive_loss, fd_loss, icl_loss, ckd_loss
 
 def neighbour_exchange(from_rank, to_rank, tensor, group=None):
     tensor_recv = torch.zeros_like(tensor)

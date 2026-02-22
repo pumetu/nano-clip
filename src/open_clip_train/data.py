@@ -325,7 +325,18 @@ class ResampledShards2(IterableDataset):
                 yield dict(url=self.rng.choices(self.urls, weights=self.weights, k=1)[0])
 
 
-def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokenizer=None):
+def _apply_teacher_student_processor(preprocess_img, dist_preprocess_img, tokenizer, dist_tokenizer):
+    def _process(sample):
+        image, text = sample["image"], sample["text"]  
+        sample["image"] = preprocess_img(image)
+        sample["dist_image"] = dist_preprocess_img(image)
+        sample["text"] = tokenizer(text)[0]
+        sample["dist_text"] = dist_tokenizer(text)[0]
+        return sample
+    return _process
+
+
+def get_wds_dataset(args, preprocess_img, dist_preprocess_img, is_train, epoch=0, floor=False, tokenizer=None, dist_tokenizer=None):
     input_shards = args.train_data if is_train else args.val_data
     assert input_shards is not None
     resampled = getattr(args, 'dataset_resampled', False) and is_train
@@ -390,8 +401,9 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
         wds.select(filter_no_caption_or_no_image),
         wds.decode("pilrgb", handler=log_and_continue),
         wds.rename(image="jpg;png;jpeg;webp", text="txt"),
-        wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
-        wds.to_tuple("image", "text"),
+        # wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
+        wds.map(_apply_teacher_student_processor(preprocess_img, dist_preprocess_img, tokenizer, dist_tokenizer)),
+        wds.to_tuple("image", "text", "dist_image", "dist_text"),
         wds.batched(args.batch_size, partial=not is_train)
     ])
 
@@ -543,22 +555,22 @@ def get_dataset_fn(data_path, dataset_type):
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
     
 
-def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
-    preprocess_train, preprocess_val = preprocess_fns
+def get_data(args, preprocess_fns, epoch=0, tokenizer=None, dist_tokenizer=None):
+    preprocess_train, preprocess_val, dist_preprocess_train, dist_preprocess_val = preprocess_fns
     data = {}
 
     if args.train_data or args.dataset_type == "synthetic":
         data["train"] = get_dataset_fn(args.train_data, args.dataset_type)(
-            args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer)
+            args, preprocess_train, dist_preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer, dist_tokenizer=dist_tokenizer)
 
     if args.val_data:
         data["val"] = get_dataset_fn(args.val_data, args.dataset_type)(
             args, preprocess_val, is_train=False, tokenizer=tokenizer)
 
     if args.imagenet_val is not None:
-        data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
+        data["imagenet-val"] = get_imagenet(args, (preprocess_train, preprocess_val), "val")
 
     if args.imagenet_v2 is not None:
-        data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")
+        data["imagenet-v2"] = get_imagenet(args, (preprocess_train, preprocess_val), "v2")
 
     return data

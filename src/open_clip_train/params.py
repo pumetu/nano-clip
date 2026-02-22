@@ -462,6 +462,11 @@ def parse_args(args):
         help='Which pre-trained weights to distill from, if any.'
     )
     parser.add_argument(
+        "--distill-loss",
+        default=None,
+        help='Distillation loss to use.'
+    )
+    parser.add_argument(
         "--use-bnb-linear",
         default=None,
         help='Replace the network linear layers from the bitsandbytes library. '

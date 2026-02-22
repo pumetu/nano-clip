@@ -89,100 +89,45 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         if not args.skip_scheduler:
             scheduler(step)
 
-        images, texts = batch
+        images, texts, distill_images, distill_texts = batch
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
+        distill_images = distill_images.to(device=device, dtype=input_dtype, non_blocking=True)
+        distill_texts = distill_texts.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
         optimizer.zero_grad()
 
-        if args.accum_freq == 1:
-            with autocast():
-                model_out = model(images, texts)
-                logit_scale = model_out["logit_scale"]
-                if args.distill:
-                    with torch.no_grad():
-                        dist_model_out = dist_model(images, texts)
-                    model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
-                losses = loss(**model_out, output_dict=True)
+        with autocast():
+            model_out = model(images, texts)
+            logit_scale = model_out["logit_scale"]
+            if args.distill:
+                with torch.no_grad():
+                    dist_model_out = dist_model(distill_images, distill_texts)
+                model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
+            losses = loss(**model_out, output_dict=True)
 
-                total_loss = sum(losses.values())
-                losses["loss"] = total_loss
+            total_loss = sum(losses.values())
+            losses["loss"] = total_loss
 
-            backward(total_loss, scaler)
-        else:
-            # First, cache the features without any gradient tracking.
-            with torch.no_grad():
-                with autocast():
-                    model_out = model(images, texts)
-
-                    for f in ("logit_scale", "logit_bias"):
-                        model_out.pop(f, None)
-
-                    for key, val in model_out.items():
-                        if key in accum_features:
-                            accum_features[key].append(val)
-                        else:
-                            accum_features[key] = [val]
-
-                accum_images.append(images)
-                accum_texts.append(texts)
-
-            # If (i + 1) % accum_freq is not zero, move on to the next batch.
-            if ((i + 1) % args.accum_freq) > 0:
-                # FIXME this makes data time logging unreliable when accumulating
-                continue
-
-            # Now, ready to take gradients for the last accum_freq batches.
-            # Re-do the forward pass for those batches, and use the cached features from the other batches as negatives.
-            # Call backwards each time, but only step optimizer at the end.
-            optimizer.zero_grad()
-            for j in range(args.accum_freq):
-                images = accum_images[j]
-                texts = accum_texts[j]
-                with autocast():
-                    model_out = model(images, texts)
-
-                    inputs_no_accum = {}
-                    inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
-                    if "logit_bias" in model_out:
-                        inputs_no_accum["logit_bias"] = model_out.pop("logit_bias")
-
-                    inputs = {}
-                    for key, val in accum_features.items():
-                        accumulated = accum_features[key]
-                        inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
-
-                    losses = loss(**inputs, **inputs_no_accum, output_dict=True)
-                    del inputs
-                    del inputs_no_accum
-                    total_loss = sum(losses.values())
-                    losses["loss"] = total_loss
-
-                backward(total_loss, scaler)
+        backward(total_loss, scaler)
 
         if scaler is not None:
-            if args.horovod:
-                optimizer.synchronize()
+            if args.grad_clip_norm is not None:
                 scaler.unscale_(optimizer)
-                if args.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                with optimizer.skip_synchronize():
-                    scaler.step(optimizer)
+                gradnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
             else:
-                if args.grad_clip_norm is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                scaler.step(optimizer)
+                with torch.no_grad():
+                    gradnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
+            scaler.step(optimizer)
             scaler.update()
         else:
             if args.grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                gradnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+            else:
+                with torch.no_grad():
+                    gradnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
             optimizer.step()
-
-        # reset gradient accum, if enabled
-        if args.accum_freq > 1:
-            accum_images, accum_texts, accum_features = [], [], {}
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -217,6 +162,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
                 f"LR: {optimizer.param_groups[0]['lr']:5f} "
+                f"Grad Norm: {gradnorm:.3f}"
                 f"Logit Scale: {logit_scale_scalar:.3f} " + loss_log
             )
 
@@ -227,7 +173,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 "samples_per_second": samples_per_second,
                 "samples_per_second_per_gpu": samples_per_second_per_gpu,
                 "scale": logit_scale_scalar,
-                "lr": optimizer.param_groups[0]["lr"]
+                "lr": optimizer.param_groups[0]["lr"],
+                "gradnorm": gradnorm
             }            
             log_data.update({name:val.val for name,val in losses_m.items()})
 
